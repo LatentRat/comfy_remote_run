@@ -124,11 +124,6 @@ class RemoteRunSerializerOutNode():
             ):
         inputs = { k: v for k, v in kwargs.items() if k.startswith("input_") }
 
-        # buffer = torch.frombuffer(os.urandom(32 * 1024), dtype = torch.uint8)
-        # buffer = torch.frombuffer(os.urandom(10 * 1024 * 1024), dtype = torch.uint8)
-        # inputs = { f"input_{i}": buffer for i in range(5) }
-        # time.sleep(20)
-
         data = serialize_obj(serialization, inputs)
         if response == "binary":
             import server
@@ -628,7 +623,7 @@ def get_input_graph_nodes(prompt: dict, root_node_id: str, add_dependent_nodes: 
 
     full_deps = get_full_dependents(prompt, input_nodes)
     for parent_id, all_deps in full_deps.items():
-        if not all_deps:
+        if not all_deps or parent_id == root_node_id:
             continue
         input_nodes.update(all_deps)
 
@@ -757,7 +752,7 @@ def partial_json_expansion(
 
     remote_obj = dict(
         prompt = remote_prompt,
-        extra_output_ids = extra_output_ids,
+        extra_output_ids = list(extra_output_ids) or None,
     )
     json_node_id_str = next_node_id()
     new_graph = {
