@@ -16,6 +16,7 @@
 
 # TODO: option to actually run IS_CHANGED checks remotely
 # TODO: option to lazily serialize/send inputs only when needed remotely?
+# TODO: torch weights_only option
 
 import base64
 import collections
@@ -349,9 +350,9 @@ class RemoteRunInputNode():
             dynprompt: DynamicPrompt = None, own_id = None, _ignore_ = None,
             **_kwargs,
             ):
-        remote_prompt = { i: dynprompt.get_node(i) for i in dynprompt.all_node_ids() }
+        prompt = { i: dynprompt.get_node(i) for i in dynprompt.all_node_ids() }
         return partial_json_expansion(
-            remote_prompt, own_id, remote_url, serialization,
+            prompt, own_id, remote_url, serialization,
             total_timeout, request_timeout,
             max_size_mb, gzip_compression, gzip_level,
             ws_compression, forward_progress_messages, is_changed, response,
@@ -479,7 +480,7 @@ def block_option_return(option: str, kwargs, num_outputs, error_msg, block_msg):
         return tuple(execution.ExecutionBlocker(f"{block_msg} out={num}") for num in range(num_outputs))
     elif option == "error":
         raise ValueError(error_msg)
-    elif option == "return none":
+    elif option == "return_none":
         return tuple(None for _ in range(num_outputs))
     else:
         raise ValueError(f"Invalid option value: {option!r}")
@@ -498,7 +499,7 @@ class RemoteRunStartNode():
             "optional": {
                 **dict((f"input_{num}", (CoIO.ANY, { })) for num in range(_NUM_OUTPUTS)),
                 "remote_run_dependent_outputs": (["ignore", "run"], { "default": "ignore" }),
-                "inputs_when_local":            (INPUTS_OFF_OPTIONS, { "default": "error" }),
+                "inputs_when_local":            (INPUTS_OFF_OPTIONS, { "default": "disconnected" }),
                 "outputs_when_local":           (BLOCK_OPTIONS, { "default": "error" }),
             },
         }
@@ -546,64 +547,9 @@ def make_counter(start: int, map = None):
     return get
 
 
-def get_extra_output_ids_dependent_on(prompt: dict, node_ids: list[str]):
-    # get all nodes that are directly or indirectly linked to the outputs of the given node_ids
-    # (generally all RemoteRunStartNodes), stop going down the chain when hitting another remote_run
-    # start or input/json node.
-
-    node_ids = set(node_ids)
-    stop_at_types = { i.TYPE_NAME for i in REMOTE_RUN_RUN_NODES + [RemoteRunStartNode] }
-    stop_at_ids = [i for i, n in prompt.items() if n["class_type"] in stop_at_types]
-    all_stop_at_ids = set(stop_at_ids) | node_ids
-    deps = get_full_dependents(prompt, all_stop_at_ids)
-
-    extra_output_ids = set()
-    for parent_id, all_deps in deps.items():
-        if not all_deps:
-            continue
-        if parent_id not in node_ids:
-            continue
-        extra_output_ids.update(all_deps)
-
-    return sorted(extra_output_ids)
-
-
-def get_full_dependents(prompt: dict, important_parent_node_ids: set[str]) -> dict[str, set[str]]:
-    # For each important_parent_node_id get all nodes that are directly or indirectly dependent on it
-    # but stop going down the chain when hitting another important_parent_node_id
-    important_parent_node_ids = set(important_parent_node_ids)
-
-    inputs_map = { }
-    for nid, node in prompt.items():
-        inputs = set()
-        for v in node["inputs"].values():
-            if isinstance(v, list) and len(v) == 2 and v[0] in prompt:
-                inputs.add(v[0])
-        inputs_map[nid] = inputs
-
-    @functools.cache
-    def get_all_parents(nid):
-        if nid in important_parent_node_ids:
-            return set()
-
-        parents = set()
-        for inp in inputs_map.get(nid) or []:
-            parents.add(inp)
-            parents.update(get_all_parents(inp))
-        return parents
-
-    res = { i: set() for i in important_parent_node_ids }
-    for nid in prompt.keys():
-        all_parents_until_parent_node_id_or_end = get_all_parents(nid)
-        important = all_parents_until_parent_node_id_or_end & important_parent_node_ids
-        for p in important:
-            res[p].add(nid)
-
-    return res
-
-
-def get_input_graph_nodes(prompt: dict, root_node_id: str, add_dependent_nodes: bool) -> set[str]:
-    input_nodes = { root_node_id }
+def get_input_graph_nodes(prompt: dict, root_node_id: str) -> tuple[set[str], set[str]]:
+    start_nodes = set()
+    input_nodes = set()
 
     def _nodes(node_id: str, seen):
         if node_id in seen:
@@ -611,6 +557,10 @@ def get_input_graph_nodes(prompt: dict, root_node_id: str, add_dependent_nodes: 
         seen.add(node_id)
 
         node = prompt[node_id]
+        if node.get("class_type") == RemoteRunStartNode.TYPE_NAME:
+            start_nodes.add(node_id)
+            return
+
         inputs = node["inputs"]
         for inp in inputs.values():
             if isinstance(inp, list):
@@ -619,20 +569,64 @@ def get_input_graph_nodes(prompt: dict, root_node_id: str, add_dependent_nodes: 
 
     _nodes(root_node_id, set())
 
-    if not add_dependent_nodes:
-        return input_nodes
+    return start_nodes, input_nodes
 
-    full_deps = get_full_dependents(prompt, input_nodes)
-    for parent_id, all_deps in full_deps.items():
-        if not all_deps or parent_id == root_node_id:
+
+def get_full_dependents_of_outputs(prompt: dict, of_main_node_ids: set[str], stop_at_node_ids = None) -> dict[str, set[str]]:
+    # For each main_node_id get all nodes that are directly or indirectly linked to its outputs
+    # but stop going down the graph when hitting another stop_at_node_ids (or main_node_id if stop_at_node_ids not given).
+    of_main_node_ids = set(of_main_node_ids)
+    stop_at_node_ids = set(stop_at_node_ids if stop_at_node_ids is not None else of_main_node_ids)
+
+    inputs_map = { }
+    for nid, node in prompt.items():
+        inputs = set()
+        for v in node["inputs"].values():
+            if isinstance(v, list) and len(v) == 2:
+                inputs.add(v[0])
+        inputs_map[nid] = inputs
+
+    @functools.cache
+    def get_all_parents(nid):
+        if nid in stop_at_node_ids:
+            return set()
+
+        parents = set()
+        for inp in inputs_map.get(nid) or []:
+            parents.add(inp)
+            parents.update(get_all_parents(inp))
+        return parents
+
+    res = { i: set() for i in of_main_node_ids }
+    for nid in prompt.keys():
+        all_parents_until_parent_node_id_or_end = get_all_parents(nid)
+        important_parents = all_parents_until_parent_node_id_or_end & of_main_node_ids
+        for p in important_parents:
+            res[p].add(nid)
+
+    return res
+
+
+def get_extra_output_ids_dependent_on(prompt: dict, node_ids: set[str], stop_at_node_ids = None):
+    # get all nodes that are directly or indirectly linked to the outputs of the given node_ids
+    # (generally all RemoteRunStartNodes), stop going down the chain when hitting another remote_run
+    # start or input/json node.
+
+    node_ids = set(node_ids)
+    stop_at_node_ids = set(stop_at_node_ids if stop_at_node_ids is not None else node_ids)
+    deps = get_full_dependents_of_outputs(prompt, node_ids, stop_at_node_ids)
+
+    extra_output_ids = set()
+    for parent_id, all_deps in deps.items():
+        if not all_deps or parent_id not in node_ids:
             continue
-        input_nodes.update(all_deps)
+        extra_output_ids.update(all_deps)
 
-    return input_nodes
+    return sorted(extra_output_ids)
 
 
 def partial_json_expansion(
-        remote_prompt: dict, root_node_id: str, remote_url: str, serialization: str,
+        prompt: dict, root_node_id: str, remote_url: str, serialization: str,
         total_timeout: float, request_timeout: float,
         max_size_mb: int | None, gzip_compression: bool, gzip_level: int,
         ws_compression: bool, forward_progress_messages: str, is_changed: bool, response: str | None,
@@ -666,10 +660,10 @@ def partial_json_expansion(
                 RemoteRunJson(run_remotely="A -> SaveImage[F]; A -> B -> C -> D", run_extra_outputs=["F"]) -> G -> H -> I
 
     """
-    remote_prompt = copy.deepcopy(remote_prompt)
+    remote_prompt = copy.deepcopy(prompt)
+    next_node_id = make_counter(_max_id(remote_prompt) + 1, str)
     rcon, dscon = update_toggles_inplace(remote_prompt, True, True, "remote_run_input_toggle", False)
 
-    next_node_id = make_counter(_max_id(remote_prompt) + 1, str)
     add_outputs_of_inputs = (run_outputs_connected_to_inputs or "").lower() == "run"
 
     if rcon or dscon:
@@ -678,21 +672,21 @@ def partial_json_expansion(
 
     extra_output_ids = None
     local_expanded_inputs = { }
+    remote_run_dependent_outputs_of_nodes = []
+    start_node_ids, other_node_ids = get_input_graph_nodes(remote_prompt, root_node_id)
 
-    start_node_ids, middle_node_ids = input_start_nodes(remote_prompt, root_node_id)
+    # The D -> E -> F part(s), anything before the RemoteRunInput node back up to any RemoteRunStart nodes
+    # and anything starting on its own.
+    small_prompt = { i: remote_prompt[i] for i in (start_node_ids | other_node_ids | { root_node_id }) }
     if start_node_ids:
-        # The D -> E -> F part(s), anything before the RemoteRunInput node up until to any RemoteRunStart nodes
-        # (plus anything hitting the top).
-        small_prompt = { i: remote_prompt[i] for i in (middle_node_ids | start_node_ids) }
-
         # For the remote prompt: just replace each RemoteStart node with a Deserializer node that outputs
         # the serialized and sent over inputs.
         # On the local side as there can be multiple RemoteStart nodes all the inputs to the RemoteStart nodes have to also
-        # be sent to the newly expanded RemoteRunJson node and kept track of which goes to which Deserializer node output.
+        # be linked up to the newly created/expanded RemoteRunJson node and kept track of which serialized inputs goes to which
+        # Deserializer node output on the remote side that replace the RemoteStart nodes in the remote prompts.
 
         next_json_input_num = make_counter(0)
 
-        remote_run_dependent_outputs_of = []
         # On remote prompt change all RemoteRunStart nodes to Deserializer nodes
         for start_id in start_node_ids:
             # TODO: ignore inputs for outputs that aren't used, currently serialized/sent for nothing
@@ -700,8 +694,8 @@ def partial_json_expansion(
             start_node = small_prompt[start_id]
             start_inputs = start_node["inputs"]
             node_remote_run_dependent_outputs = start_inputs.get("remote_run_dependent_outputs")
-            if add_outputs_of_inputs or (node_remote_run_dependent_outputs or "").lower() == "run":
-                remote_run_dependent_outputs_of.append(start_id)
+            if (node_remote_run_dependent_outputs or "").lower() == "run":
+                remote_run_dependent_outputs_of_nodes.append(start_id)
 
             des = { }
             for input_name, input_value in start_inputs.items():
@@ -725,26 +719,27 @@ def partial_json_expansion(
                 },
             }
 
-        if remote_run_dependent_outputs_of:
-            # Add all nodes that are between a StartNode and either free floating like Output nodes or until hitting a RemoteRunInput node.
-            # This is all dependent nodes not just Output ones but no need to check for only output ones since any normal non output
-            # nodes given will just be ignored by the prompt handling (currently).
+    if add_outputs_of_inputs:
+        input_node_ids = start_node_ids | other_node_ids
+        stop_at = start_node_ids | { root_node_id }
+        extra_output_ids = get_extra_output_ids_dependent_on(remote_prompt, input_node_ids, stop_at_node_ids = stop_at)
+        logger.info("partial_json_expansion %s: add_outputs_of_inputs -> extra_output_ids=%s",
+                    root_node_id, (len(extra_output_ids), extra_output_ids))
+    elif remote_run_dependent_outputs_of_nodes:
+        # Add all output nodes that go off away from the input graph, so between a start or StartNode to RemoteRunInput node,
+        # but don't themselves lead to the RemoteRunInput node.
+        extra_output_ids = get_extra_output_ids_dependent_on(remote_prompt, set(remote_run_dependent_outputs_of_nodes), stop_at_node_ids = { root_node_id })
+        logger.info("partial_json_expansion %s: remote_run_dependent_outputs_of_nodes=%s -> extra_output_ids=%s",
+                    root_node_id, remote_run_dependent_outputs_of_nodes, (len(extra_output_ids), extra_output_ids))
 
-            extra_output_ids = get_extra_output_ids_dependent_on(remote_prompt, remote_run_dependent_outputs_of)
-            logger.info("partial_json_expansion %s: remote_run_dependent_outputs_of=%s -> extra_output_ids=%s",
-                        root_node_id, remote_run_dependent_outputs_of, (len(extra_output_ids), extra_output_ids))
+    # This is really all dependent nodes not just Output ones but no need to limit to only output ones since any normal non output
+    # nodes given will just be ignored by comfy prompt handling (currently).
+    extra_output_ids = list(extra_output_ids) if extra_output_ids else None
+    for i in extra_output_ids or []:
+        if i not in small_prompt:
+            small_prompt[i] = remote_prompt[i]
 
-            for eid in extra_output_ids:
-                if eid in remote_prompt:
-                    continue
-                small_prompt[eid] = copy.deepcopy(remote_prompt[eid])
-
-        remote_prompt = small_prompt
-    else:
-        input_graph_ids = get_input_graph_nodes(remote_prompt, root_node_id, add_dependent_nodes = add_outputs_of_inputs)
-        extra_output_ids = input_graph_ids if add_outputs_of_inputs else None
-        remote_prompt = { i: remote_prompt[i] for i in input_graph_ids }
-
+    remote_prompt = small_prompt
     root_node = remote_prompt.pop(root_node_id)
     root_inputs = { k: v for k, v in root_node["inputs"].items() if isinstance(v, list) }
     remote_prompt[root_node_id] = {
@@ -759,7 +754,7 @@ def partial_json_expansion(
 
     remote_obj = dict(
         prompt = remote_prompt,
-        extra_output_ids = list(extra_output_ids) or None,
+        extra_output_ids = extra_output_ids,
     )
     json_node_id_str = next_node_id()
     new_graph = {
@@ -789,31 +784,6 @@ def partial_json_expansion(
         "result": replaced_output_ids,
         "expand": new_graph,
     }
-
-
-def input_start_nodes(prompt: dict, start_id: str):
-    start_nodes = set()
-    middle_node_ids = set()
-
-    def _nodes(node_id: str):
-        if node_id in middle_node_ids:
-            return
-        middle_node_ids.add(node_id)
-
-        node = prompt[node_id]
-        if node["class_type"] == RemoteRunStartNode.TYPE_NAME:
-            start_nodes.add(node_id)
-            return
-
-        inputs = node["inputs"]
-        for inp in inputs.values():
-            if isinstance(inp, list):
-                _nodes(inp[0])
-
-    _nodes(start_id)
-
-    middle_node_ids = middle_node_ids - start_nodes
-    return start_nodes, middle_node_ids
 
 
 def serialize_obj(serialization: str, obj):
@@ -856,62 +826,6 @@ def output_nodes_transform(prompt: dict, output_nodes: str, keep_nodes: set[str]
         return { k: v for k, v in prompt.items() if k not in output_ids }
 
     return prompt
-
-
-def build_full_prompt(
-        remote_prompt: dict, start_id: str, response: str | None,
-        max_size_mb: int | None, gzip_compression: bool, gzip_level: int,
-        is_changed: bool,
-
-) -> dict:
-    own_node = remote_prompt[start_id]
-
-    # simple = True
-    simple = False
-    if simple:
-        # Simple method: Copy full current prompt and just delete all outputs from it,
-        # then replace own node with an input serializing & returning node.
-        # Only the input nodes to this should be run in theory unless any extension/node does anything weird.
-
-        run_prompt = copy.deepcopy(remote_prompt)
-        output_ids = prompt_outputs(run_prompt)
-        run_prompt = { k: v for k, v in run_prompt.items() if k not in output_ids }
-    else:
-        # Go though input node graphs and make new prompt only from nodes that lead to the inputs of this node.
-        input_nodes = set()
-
-        def _nodes(node_id: str, seen):
-            if node_id in seen:
-                return
-            seen.add(node_id)
-
-            node = remote_prompt[node_id]
-            inputs = node["inputs"]
-            for inp in inputs.values():
-                if isinstance(inp, list):
-                    input_nodes.add(inp[0])
-                    _nodes(inp[0], seen)
-
-        _nodes(start_id, set())
-        run_prompt = { i: remote_prompt[i] for i in input_nodes }
-
-    inputs = copy.deepcopy(own_node["inputs"])
-    inputs = { k: v for k, v in inputs.items() if k.startswith("input_") or k == "serialization" }
-    inputs.update(dict(
-        max_size_mb = max_size_mb,
-        response = response,
-        gzip_compression = gzip_compression,
-        gzip_level = gzip_level,
-        is_changed = is_changed,
-    ))
-
-    # replace own node with input serializer output node
-    run_prompt[start_id] = {
-        "inputs":     inputs,
-        "class_type": RemoteRunSerializerOutNode.TYPE_NAME,
-    }
-
-    return run_prompt
 
 
 def update_toggles_inplace(prompt: dict, toggle: bool, reconnect: bool, label: str, raise_on_existing: bool, input_node_is_local: bool = True):
