@@ -15,6 +15,7 @@
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # TODO: option to actually run IS_CHANGED checks remotely
+# TODO: option to lazily serialize/send inputs only when needed remotely?
 
 import base64
 import collections
@@ -643,26 +644,33 @@ def partial_json_expansion(
             to
             A -> B -> C -> RemoteRunJson(run_remotely="D -> E -> F") -> G -> H -> I
 
-            Build an expanded graph to replace the RemoteRunInput node with a RemoteRunJson node.
-            Copy the whole input graph into RemoteRunInput node until a RemoteStart node is hit,
-            and replace that whole chunk with a RemoteRunJson node that will run that part instead.
-            The RemoteRunJson gets linked to all the inputs of the RemoteStart nodes so it can serialize them and send them
-            to the remote instance as part of the remote prompt.
-        If no RemoteStart nodes take all the nodes that the RemoteRunInput node depends on and
-        optionally also all nodes that depend on the RemoteRunInput node if run_outputs_connected_to_inputs is "run".
+            Build an expanded graph to replace the RemoteRunInput node with a RemoteRunJson node copying
+            the whole input graph going to the RemoteRunInput node up until RemoteStart nodes are hit,
+            and replace all those nodes with a RemoteRunJson node that will run that part as prompt remotely instead.
+            The RemoteRunJson gets linked to all the inputs of the RemoteStart nodes if any so it can serialize
+            them and send them to the remote instance as part of the remote prompt.
+            Optionally if remote_run_dependent_outputs==run then also include all other nodes that are connected to
+            the outputs of any input graph nodes but don't lead to the RemoteRunInput node and run outputs in those too,
+            see below for example, this can be set either for everything if the RemoteRunInput node has it set
+            or per RemoteRunStart node for anything going off a node in between that and the RemoteRunInput node.
+
+        If there are no RemoteStart nodes then take all the nodes going into RemoteRunInput.
+        Optionally also all nodes that go off those inputs nodes too if run_outputs_connected_to_inputs is set to "run",
+        so if there are any outputs as part of the input graph but that doesn't lead to RemoteRunInput those get run too.
         So from:
                 A -> B -> C -> D -> RemoteRunInput -> G -> H -> I
-                A -> SaveImage
+                A -> SaveImage[F]
             to:
                 RemoteRunJson(run_remotely="A -> B -> C -> D") -> G -> H -> I
             or with run_outputs_connected_to_inputs = "run" to:
-                RemoteRunJson(run_remotely="A -> SaveImage; A -> B -> C -> D", run_extra_output=["D"]) -> G -> H -> I
+                RemoteRunJson(run_remotely="A -> SaveImage[F]; A -> B -> C -> D", run_extra_outputs=["F"]) -> G -> H -> I
 
     """
     remote_prompt = copy.deepcopy(remote_prompt)
     rcon, dscon = update_toggles_inplace(remote_prompt, True, True, "remote_run_input_toggle", False)
 
     next_node_id = make_counter(_max_id(remote_prompt) + 1, str)
+    add_outputs_of_inputs = (run_outputs_connected_to_inputs or "").lower() == "run"
 
     if rcon or dscon:
         logger.info("%s", f"partial_json_expansion {root_node_id=} toggled {rcon + dscon} nodes, "
@@ -692,7 +700,7 @@ def partial_json_expansion(
             start_node = small_prompt[start_id]
             start_inputs = start_node["inputs"]
             node_remote_run_dependent_outputs = start_inputs.get("remote_run_dependent_outputs")
-            if (node_remote_run_dependent_outputs or "").lower() == "run":
+            if add_outputs_of_inputs or (node_remote_run_dependent_outputs or "").lower() == "run":
                 remote_run_dependent_outputs_of.append(start_id)
 
             des = { }
@@ -733,7 +741,6 @@ def partial_json_expansion(
 
         remote_prompt = small_prompt
     else:
-        add_outputs_of_inputs = (run_outputs_connected_to_inputs or "").lower() == "run"
         input_graph_ids = get_input_graph_nodes(remote_prompt, root_node_id, add_dependent_nodes = add_outputs_of_inputs)
         extra_output_ids = input_graph_ids if add_outputs_of_inputs else None
         remote_prompt = { i: remote_prompt[i] for i in input_graph_ids }
@@ -1093,9 +1100,6 @@ def remote_execute_prompt(
                 compression = "deflate" if ws_compression else None,
             )
 
-        # import logging
-        # logging.getLogger("websockets").setLevel(logging.DEBUG)
-        # logging.getLogger("websockets").setLevel(logging.INFO)
         logger.debug("Connecting to websocket url=%r", ws_url)
         websocket = connect()
         prompt_id = post(short_timeout)
