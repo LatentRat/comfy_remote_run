@@ -15,8 +15,9 @@
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # TODO: option to actually run IS_CHANGED checks remotely
-# TODO: option to lazily serialize/send inputs only when needed remotely?
+# TODO: option to lazily serialize/send inputs only when needed remotely? and option to cache them remotely too
 # TODO: torch weights_only option
+# TODO: clear remote history item afterwards option
 
 import base64
 import collections
@@ -53,7 +54,7 @@ logger = _logging.getLogger(__name__)
 
 jdumps = lambda data: json.dumps(data).replace("\n", "")
 
-_NUM_OUTPUTS = int(os.environ.get("RAT_REMOTE_RUN_NUM_OUTPUTS") or 5)
+_NUM_OUTPUTS = int(os.environ.get("RAT_REMOTE_RUN_NUM_OUTPUTS") or 10)
 logger.info("%s", f"RemoteRun nodes using _NUM_OUTPUTS={_NUM_OUTPUTS}")
 
 TOGGLE_CHOICES = ("only_locally", "only_remotely")
@@ -92,7 +93,7 @@ def shared_input_settings():
 
 class RemoteRunSerializerOutNode():
     TYPE_NAME = "RAT_RemoteRunSerializerOut"
-    DISPLAY_NAME = "Remote Run Serializer Output (Internal)"
+    DISPLAY_NAME = "ReRu Serializer Output (Internal)"
 
     CATEGORY = "Remote Run/__Internal__/"
     FUNCTION = "run"
@@ -179,7 +180,7 @@ class RemoteRunSerializerOutNode():
 
 class RemoteRunDeserializerOutNode():
     TYPE_NAME = "RAT_RemoteRunDeserializerOut"
-    DISPLAY_NAME = "Remote Run Deserializer Output (Internal)"
+    DISPLAY_NAME = "ReRu Deserializer Output (Internal)"
 
     CATEGORY = "Remote Run/__Internal__/"
     FUNCTION = "run"
@@ -201,11 +202,13 @@ class RemoteRunDeserializerOutNode():
 
     def run(self, serialization: str, data: str, **_kwargs):
         obj = deserialize_response(serialization, data)
-        print("RemoteRunDeserializerOutNode", obj)
         return tuple(obj.get(i) for i in range(_NUM_OUTPUTS))
 
 
-class RemoteRunToggler():
+class RemoteRunTogglerNode():
+    TYPE_NAME = "RAT_RemoteRunToggler"
+    DISPLAY_NAME = "ReRu Toggle"
+
     """
     This is a Input Toggle Switch that can be used to enable/disable certain parts of a graph
     in the exact opposite way between the local and remote side using lazy evaluation or prompt preprocessing.
@@ -216,9 +219,6 @@ class RemoteRunToggler():
     the run_side value so the remote side will do the exact opposite of the local one,
     without even knowing it's the remote side.
     """
-    TYPE_NAME = "RAT_RemoteRunToggler"
-    DISPLAY_NAME = "Remote Run Toggle"
-
     CATEGORY = "Remote Run"
     FUNCTION = "run"
 
@@ -304,7 +304,7 @@ def _get_max_size(max_size_mb: int | None):
 
 class RemoteRunInputNode():
     TYPE_NAME = "RAT_RemoteRunInput"
-    DISPLAY_NAME = "Remote Run Input Graph(s)"
+    DISPLAY_NAME = "ReRu Input Graph(s)"
 
     NUM_OUTPUTS = _NUM_OUTPUTS
     CATEGORY = "Remote Run"
@@ -362,13 +362,13 @@ class RemoteRunInputNode():
 
 class RemoteRunInputOutputNode(RemoteRunInputNode):
     TYPE_NAME = "RAT_RemoteRunInputOutput"
-    DISPLAY_NAME = "Remote Run Input Graph(s) Output"
+    DISPLAY_NAME = "ReRu Input Graph(s) Output"
     OUTPUT_NODE = True
 
 
 class RemoteRunJsonNode():
     TYPE_NAME = "RAT_RemoteRunJson"
-    DISPLAY_NAME = "Remote Run JSON"
+    DISPLAY_NAME = "ReRu JSON"
 
     NUM_OUTPUTS = _NUM_OUTPUTS
     CATEGORY = "Remote Run"
@@ -487,8 +487,8 @@ def block_option_return(option: str, kwargs, num_outputs, error_msg, block_msg):
 
 
 class RemoteRunStartNode():
-    TYPE_NAME = "RAT_RemoteStart"
-    DISPLAY_NAME = "Remote Run Start From Here ->"
+    TYPE_NAME = "RAT_RemoteRunStart"
+    DISPLAY_NAME = "ReRu Start From Here ->"
 
     CATEGORY = "Remote Run"
     FUNCTION = "run"
@@ -830,8 +830,8 @@ def output_nodes_transform(prompt: dict, output_nodes: str, keep_nodes: set[str]
 
 def update_toggles_inplace(prompt: dict, toggle: bool, reconnect: bool, label: str, raise_on_existing: bool, input_node_is_local: bool = True):
     to_switch = {
-        RemoteRunToggler.TYPE_NAME:   "inputs_when_off",
-        RemoteRunInputNode.TYPE_NAME: "inputs_when_local",
+        RemoteRunTogglerNode.TYPE_NAME: "inputs_when_off",
+        RemoteRunInputNode.TYPE_NAME:   "inputs_when_local",
     }
     reconnected_cnt = disconnected_cnt = 0
     for node_id, node in prompt.items():
@@ -844,7 +844,7 @@ def update_toggles_inplace(prompt: dict, toggle: bool, reconnect: bool, label: s
         if not inputs:
             continue
 
-        if class_type == RemoteRunToggler.TYPE_NAME:
+        if class_type == RemoteRunTogglerNode.TYPE_NAME:
             enabled = inputs.get("enabled")
             if enabled not in TOGGLE_CHOICES:
                 raise ValueError("Invalid enabled value", node_id, enabled, TOGGLE_CHOICES)
@@ -1087,6 +1087,30 @@ def remote_execute_prompt(
             threading.Thread(target = websocket.close, daemon = True).start()
 
 
+class RemoteRunSetNumOutputsNode():
+    DISPLAY_NAME = "ReRu Set Num Outputs"
+
+    CATEGORY = "Remote Run"
+    FUNCTION = "run"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "num": ("INT", { "default": 10, "min": 1, "max": 100, "step": 1 }),
+            },
+        }
+
+    RETURN_TYPES = ()
+
+    def run(self, num: int):
+        global _NUM_OUTPUTS
+        logger.info("Changing RemoteRun number of inputs/outputs from %d to %d", _NUM_OUTPUTS, num)
+        _NUM_OUTPUTS = num
+        return { }
+
+
 def add_server_prompt_nonce_handler():
     logger.info("Adding promptserver remote_run nonce no duplicate prompt handler")
     import server
@@ -1166,9 +1190,11 @@ else:
 
 
 def node_mappings(classes):
+    make_type_name = lambda cn: f"RAT_{cn.removesuffix('Node')}"
+
     class_map, name_map = { }, { }
     for i in classes:
-        type_name = getattr(i, "TYPE_NAME", i.__name__)
+        type_name = getattr(i, "TYPE_NAME", make_type_name(i.__name__))
         class_map[type_name] = i
         name_map[type_name] = getattr(i, "DISPLAY_NAME", type_name)
 
@@ -1184,7 +1210,8 @@ NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS = node_mappings(
     (
         RemoteRunStartNode,
         *REMOTE_RUN_RUN_NODES,
-        RemoteRunToggler,
+        RemoteRunTogglerNode,
         RemoteRunSerializerOutNode, RemoteRunDeserializerOutNode,
+        RemoteRunSetNumOutputsNode,
     )
 )
