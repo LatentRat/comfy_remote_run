@@ -26,6 +26,7 @@ import enum
 import functools
 import gzip
 import math
+import re
 import threading
 import time
 import os
@@ -35,6 +36,7 @@ from uuid import uuid4
 from zipfile import ZipFile
 
 import execution
+import nodes
 from comfy_execution.graph import DynamicPrompt
 
 import requests
@@ -1111,6 +1113,188 @@ class RemoteRunSetNumOutputsNode():
         return { }
 
 
+def filter_definitions(definitions: dict, kwargs):
+    type_regexes = [v for k, v in kwargs.items() if k.startswith("class_type_include_regex_") and v]
+    display_name_regexes = [v for k, v in kwargs.items() if k.startswith("display_name_include_regex_") and v]
+    ignore_type_regexes = [v for k, v in kwargs.items() if k.startswith("class_type_ignore_regex_") and v]
+    ignore_display_name_regexes = [v for k, v in kwargs.items() if k.startswith("display_name_ignore_regex_") and v]
+    category_name_regexes = [v for k, v in kwargs.items() if k.startswith("category_name_regex_") and v]
+    category_name_ignore_regexes = [v for k, v in kwargs.items() if k.startswith("category_name_ignore_regex_") and v]
+
+    type_regexes = [re.compile(r, flags = re.IGNORECASE) for r in type_regexes]
+    display_name_regexes = [re.compile(r, flags = re.IGNORECASE) for r in display_name_regexes]
+    ignore_type_regexes = [re.compile(r, flags = re.IGNORECASE) for r in ignore_type_regexes]
+    ignore_display_name_regexes = [re.compile(r, flags = re.IGNORECASE) for r in ignore_display_name_regexes]
+    category_name_regexes = [re.compile(r, flags = re.IGNORECASE) for r in category_name_regexes]
+    category_name_ignore_regexes = [re.compile(r, flags = re.IGNORECASE) for r in category_name_ignore_regexes]
+
+    matching = { }
+    for class_type, node_class in definitions.items():
+        if type_regexes and not any(r.search(class_type) for r in type_regexes):
+            continue
+        if ignore_type_regexes and any(r.search(class_type) for r in ignore_type_regexes):
+            continue
+
+        display_name = node_class.get("display_name", None)
+        if display_name and display_name_regexes and not any(r.search(display_name) for r in display_name_regexes):
+            continue
+        if display_name and ignore_display_name_regexes and any(r.search(display_name) for r in ignore_display_name_regexes):
+            continue
+
+        category = node_class.get("category", None)
+        if category and category_name_regexes and not any(r.search(category) for r in category_name_regexes):
+            continue
+        if category and category_name_ignore_regexes and any(r.search(category) for r in category_name_ignore_regexes):
+            continue
+
+        matching[class_type] = node_class
+    return matching
+
+
+class RemoteRunAddRemoteNodeDefinitionsNode():
+    DISPLAY_NAME = "ReRu Add Remote Node Definitions"
+
+    CATEGORY = "Remote Run"
+    FUNCTION = "run"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "remote_url":           ("STRING", {
+                    "default": "http://127.0.0.1:8189/",
+                    "tooltip": "ComfyUI instance URL",
+                }),
+                "request_timeout":      ("FLOAT", {
+                    "tooltip": "short timeout in seconds",
+                    "default": 15.0, "min": 0.1, "max": 24 * 3600.0, "step": 0.1
+                }),
+                "dry_run":              ("BOOLEAN", { "default": False }),
+                "display_name_prefix":  ("STRING", { "default": "[RemoteNd] " }),
+                "display_name_suffix":  ("STRING", { "default": "" }),
+                "category_name_prefix": ("STRING", { "default": "[RemoteNd]/" }),
+                "category_name_suffix": ("STRING", { "default": "" }),
+                "overwrite_existing":   ("BOOLEAN", { "default": False }),
+                "is_changed":           ("BOOLEAN", { "default": False }),
+            },
+            "optional": {
+                **{ f"class_type_include_regex_{i}": ("STRING", { }) for i in range(5) },
+                **{ f"display_name_include_regex_{i}": ("STRING", { }) for i in range(5) },
+                **{ f"class_type_ignore_regex_{i}": ("STRING", { }) for i in range(5) },
+                **{ f"display_name_ignore_regex_{i}": ("STRING", { }) for i in range(5) },
+                **{ f"category_name_regex_{i}": ("STRING", { }) for i in range(5) },
+                **{ f"category_name_ignore_regex_{i}": ("STRING", { }) for i in range(5) },
+            },
+        }
+
+    RETURN_TYPES = ()
+
+    @classmethod
+    def IS_CHANGED(cls, is_changed: bool = False, **_kwargs):
+        return time.time_ns() if is_changed else None
+
+    def run(self, remote_url: str, request_timeout: float, is_changed: float | None = None, **kwargs):
+        if not remote_url.endswith("/"):
+            remote_url += "/"
+        if not remote_url.startswith("http"):
+            raise ValueError("Invalid remote_url, must start with http:// or https://", remote_url)
+
+        url = remote_url + "object_info"
+        resp = requests.get(url, timeout = request_timeout)
+        if not resp.status_code == 200:
+            raise ValueError("Failed to get remote object info", url, resp.status_code, resp.content)
+        obj = resp.json()
+        logger.info("Got %s node definitions from remote %r", len(obj or { }), remote_url)
+        self.add_definitions(obj, kwargs)
+        return { }
+
+    def add_definitions(self, definitions: dict, kwargs):
+        matching = filter_definitions(definitions, kwargs)
+        logger.info("Found %d matching node definitions of %s", len(matching), len(definitions))
+        if not matching:
+            return
+
+        stats = collections.defaultdict(int)
+        for class_type, node_obj in matching.items():
+            try:
+                self.add_definition(class_type, node_obj, stats, **kwargs)
+            except Exception as e:
+                logger.error(f"Error adding node definition for class {class_type!r}: {e}")
+                stats["errored"] += 1
+
+        added, overwrote, skipped, errored = stats["added"], stats["overwrote"], stats["skipped"], stats["errored"]
+        dry_run_label = "DRYRUN: " if kwargs.get("dry_run") else ""
+        logger.info("%s", f"{dry_run_label}Processed {len(matching)} node definitions "
+                          f"(added: {added}, overwrote: {overwrote}, skipped: {skipped}, errors: {errored}) of {len(definitions)} total definitions")
+
+    def add_definition(self, class_type: str, defn: dict, stats: dict,
+                       dry_run: bool = False,
+                       overwrite_existing: bool = False,
+                       display_name_prefix: str = "",
+                       display_name_suffix: str = "",
+                       category_name_prefix: str = "",
+                       category_name_suffix: str = "",
+                       **_kwargs,
+                       ):
+        dry_run_label = "DRYRUN: " if dry_run else ""
+        stats = stats if stats is not None else { }
+        existed = class_type in nodes.NODE_CLASS_MAPPINGS
+        if existed and not overwrite_existing:
+            logger.debug("%s", f"{dry_run_label}Skipped existing node class: {class_type}")
+            stats["skipped"] += 1
+            return
+
+        display_name = defn.get("display_name", class_type)
+        if display_name_prefix:
+            display_name = f"{display_name_prefix}{display_name}"
+        if display_name_suffix:
+            display_name = f"{display_name}{display_name_suffix}"
+
+        category = defn.get("category") or ""
+        if category_name_prefix:
+            category = f"{category_name_prefix}{category}"
+        if category_name_suffix:
+            category = f"{category}{category_name_suffix}"
+
+        def tup_get(key):
+            val = defn.get(key)
+            if val is None:
+                return None
+            if isinstance(val, list):
+                return tuple(val)
+            raise ValueError(f"Invalid {key} value, must be list or None", val)
+
+        input_types = defn.get("input")
+
+        @classmethod
+        def INPUT_TYPES(cls):
+            return input_types
+
+        new_class = type(class_type, (object,), { })
+        setattr(new_class, "INPUT_TYPES", INPUT_TYPES)
+
+        for name, val in (
+                ("DISPLAY_NAME", display_name),
+                ("CATEGORY", category),
+                ("RETURN_TYPES", tup_get("output")),
+                ("RETURN_NAMES", tup_get("output_name")),
+                ("DESCRIPTION", defn.get("description")),
+                ("OUTPUT_NODE", defn.get("output_node")),
+        ):
+            if val is not None:
+                setattr(new_class, name, val)
+
+        if not dry_run:
+            nodes.NODE_CLASS_MAPPINGS[class_type] = new_class
+            if display_name is not None:
+                nodes.NODE_DISPLAY_NAME_MAPPINGS[class_type] = display_name
+
+        stat_name = "overwrote" if existed else "added"
+        logger.info("%s", f"{dry_run_label}{stat_name.capitalize()} node class: {class_type} ({display_name})")
+        stats[stat_name] += 1
+
+
 def add_server_prompt_nonce_handler():
     logger.info("Adding promptserver remote_run nonce no duplicate prompt handler")
     import server
@@ -1212,6 +1396,8 @@ NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS = node_mappings(
         *REMOTE_RUN_RUN_NODES,
         RemoteRunTogglerNode,
         RemoteRunSerializerOutNode, RemoteRunDeserializerOutNode,
+
         RemoteRunSetNumOutputsNode,
+        RemoteRunAddRemoteNodeDefinitionsNode,
     )
 )
