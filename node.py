@@ -74,7 +74,7 @@ def serialization_load_input(name = "serialization"):
 
 
 def response_input(name = "response"):
-    return { name: (["base64_result", "binary"], { "default": "base64_result" }) }
+    return { name: (["base64_result", "binary"], { "default": "binary" }) }
 
 
 def ws_settings_inputs():
@@ -189,22 +189,48 @@ class RemoteRunDeserializerOutNode():
 
     @classmethod
     def INPUT_TYPES(cls):
-        inputs = {
+        inputs = { }
+        for num in range(_NUM_OUTPUTS):
+            inputs[f"input_{num}_info"] = (CoIO.ANY, { "lazy": True })
+            inputs[f"input_{num}_data"] = (CoIO.ANY, { "lazy": True })
+        return {
             "required": {
-                **serialization_load_input(),
-                "data": ("STRING", { }),
             },
             "optional": {
+                **inputs,
                 "is_changed": ("BOOLEAN", { "default": False }),
             },
         }
-        return inputs
 
     RETURN_TYPES = tuple([CoIO.ANY] * _NUM_OUTPUTS)
 
-    def run(self, serialization: str, data: str, **_kwargs):
-        obj = deserialize_response(serialization, data)
-        return tuple(obj.get(i) for i in range(_NUM_OUTPUTS))
+    def run(self, **kwargs):
+        info_keys = [i for i in kwargs.keys() if i.startswith("input_") and i.endswith("_info")]
+        nums = sorted(int(i[6:-5]) for i in info_keys)
+        outputs = { }
+        for in_num in nums:
+            info_str = kwargs[f"input_{in_num}_info"]
+            data = kwargs[f"input_{in_num}_data"]
+            if info_str == "INPUT":
+                outputs[in_num] = data
+                continue
+
+            info = json.loads(info_str)
+            data_type = info["type"]
+            if data_type == "serialized":
+                outputs[in_num] = deserialize_response(info["serialization"], data)
+                continue
+
+            if data_type == "request":
+                # setup server route endpoint
+                # send ws dict(type="need_data", key=info["key"])
+                # wait for data to be posted to the endpoint
+                # deserialize & return
+                continue
+
+            raise ValueError("Invalid input data type", in_num, info)
+
+        return tuple(outputs.get(i, None) for i in range(_NUM_OUTPUTS))
 
 
 class RemoteRunTogglerNode():
@@ -410,6 +436,10 @@ class RemoteRunJsonNode():
         extra_output_ids = run_obj.get("extra_output_ids") or None
         run_prompt = run_obj["prompt"]
         data_total = 0
+
+        # lazily_transfer = False
+        # no_lazy_if_smaller_than = 32 * 1024
+
         for node_id, node in run_prompt.items():
             # serialize needed inputs to this node and set up
             # Deserializer data output nodes with the serialized data in the remote prompt
@@ -417,14 +447,13 @@ class RemoteRunJsonNode():
                 config = node.pop("deserializer_config")
                 outputs = config["outputs"]
 
-                data = { }
+                inputs = { }
                 for output_name, output_data in outputs.items():
                     if not isinstance(output_data, list) or not len(output_data) == 2:
                         raise ValueError("Invalid output data", output_data, config)
 
                     if not output_name.startswith("output_") and output_name[7:].isdigit():
                         raise ValueError("Invalid output data", output_data, config)
-
                     output_num = int(output_name[7:])
 
                     output_data_type, output_data_value = output_data
@@ -433,22 +462,28 @@ class RemoteRunJsonNode():
                             raise ValueError("Invalid output data", output_data, config)
 
                         local_input_name = output_data_value
-                        data[output_num] = kwargs[local_input_name]
+                        input = kwargs[local_input_name]
+                        input_data = serialize_obj(serialization, input)
+                        input_data_b64 = base64.b64encode(input_data).decode()
+
+                        data_total += len(input_data_b64)
+                        if max_size_mb and data_total > max_size_mb * 1024 * 1024:
+                            raise ValueError(f"Serialized data too large: {data_total} bytes, max_size_mb={max_size_mb}")
+
+                        inputs[f"input_{output_num}_info"] = json.dumps({
+                            "type":          "serialized",
+                            "serialization": serialization,
+                        })
+                        inputs[f"input_{output_num}_data"] = input_data_b64
                     elif output_data_type == "CONSTANT":
-                        data[output_num] = output_data_value
+                        inputs[f"input_{output_num}_info"] = "INPUT"
+                        inputs[f"input_{output_num}_data"] = output_data_value
                     else:
                         raise ValueError("Invalid output data", output_data, config)
 
-                data = serialize_obj(serialization, data)
-                data = base64.b64encode(data).decode()
-
-                data_total += len(data)
-                if max_size_mb and data_total > max_size_mb * 1024 * 1024:
-                    raise ValueError(f"Serialized data too large: {data_total} bytes, max_size_mb={max_size_mb}")
-
                 node["inputs"] = {
                     "serialization": serialization,
-                    "data":          data,
+                    **inputs,
                 }
 
         serializers = { k: v for k, v in run_prompt.items() if v["class_type"] == RemoteRunSerializerOutNode.TYPE_NAME }
@@ -822,14 +857,6 @@ def deserialize_data(serialization: str, data: bytes):
         raise ValueError("Unknown serialization method", serialization)
 
 
-def output_nodes_transform(prompt: dict, output_nodes: str, keep_nodes: set[str] = None) -> dict:
-    if output_nodes == "Remove":
-        output_ids = set(prompt_outputs(prompt)) - (keep_nodes or set())
-        return { k: v for k, v in prompt.items() if k not in output_ids }
-
-    return prompt
-
-
 def update_toggles_inplace(prompt: dict, toggle: bool, reconnect: bool, label: str, raise_on_existing: bool, input_node_is_local: bool = True):
     to_switch = {
         RemoteRunTogglerNode.TYPE_NAME: "inputs_when_off",
@@ -904,16 +931,6 @@ def update_toggles_inplace(prompt: dict, toggle: bool, reconnect: bool, label: s
     return reconnected_cnt, disconnected_cnt
 
 
-def prompt_outputs(prompt: dict) -> list[str]:
-    valid = execution.validate_prompt(prompt)
-    if not valid[0]:
-        if isinstance(valid[1], dict) and valid[1].get("type") == "prompt_no_outputs":
-            return []
-        raise Exception(f"Prompt validation failed, couldn't get output node ids: {valid}, {prompt}")
-    outputs = valid[2]
-    return outputs
-
-
 def retry_dec(total_tries: int = 1, log_exc = True, sleep = None, stop_on = None):
     if isinstance(stop_on, type):
         stop_on = (stop_on,)
@@ -981,10 +998,6 @@ def remote_execute_prompt(
             nonce = post_nonce,  # for safe retry, assumes nonce duplicate node/extension installed
             partial_execution_targets = list(extra_output_ids or []) + [own_id],
         )
-
-        if os.environ.get("DEV") == "1":
-            from pathlib import Path
-            Path(f"./dev/jsons/post_prompt__{time.time_ns()}.json").write_text(json.dumps(prompt))
 
         body = json.dumps(apicall)
         if isinstance(body, str):
