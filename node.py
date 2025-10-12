@@ -25,11 +25,14 @@ import copy
 import enum
 import functools
 import gzip
+import hashlib
 import math
+import queue
 import re
 import threading
 import time
 import os
+import weakref
 from io import BytesIO
 
 from uuid import uuid4
@@ -54,6 +57,22 @@ from comfy.comfy_types import IO as CoIO
 
 logger = _logging.getLogger(__name__)
 
+if (IS_DEV := os.environ.get("DEV") == "1"):
+    IS_DEV_PROMPTSAVE = True
+    IS_DEV_PROMPTSAVE = False
+
+
+    def DEBUG_PROMPT_SAVE(label, prompt):
+        from pathlib import Path
+        dir = Path(f"./dev/jsons/")
+        if not dir.exists():
+            dir.mkdir(parents = False, exist_ok = True)
+
+        from comfy.cli_args import args
+        import datetime
+        now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d_%H-%M-%S.%f")
+        Path(f"./dev/jsons/port={args.port}____{label}__{now}__{time.time_ns()}.json").write_text(json.dumps(prompt))
+
 jdumps = lambda data: json.dumps(data).replace("\n", "")
 
 _NUM_OUTPUTS = int(os.environ.get("RAT_REMOTE_RUN_NUM_OUTPUTS") or 10)
@@ -62,6 +81,7 @@ logger.info("%s", f"RemoteRun nodes using _NUM_OUTPUTS={_NUM_OUTPUTS}")
 TOGGLE_CHOICES = ("only_locally", "only_remotely")
 INPUTS_OFF_OPTIONS = ["lazy", "disconnected"]
 BLOCK_OPTIONS = ["error", "block_execution_silent", "block_execution_verbose", "passthrough", "return_none"]
+SERIALIZATION_OPTIONS = ["safe_torch_pt", "unsafe_torch_pt", "fancy_safetensors"]
 
 
 class BinaryResponseMessageID(enum.IntEnum):
@@ -70,7 +90,7 @@ class BinaryResponseMessageID(enum.IntEnum):
 
 
 def serialization_load_input(name = "serialization"):
-    return { name: (["safe_torch_pt", "unsafe_torch_pt", "fancy_safetensors"], { "default": "fancy_safetensors" }) }
+    return { name: (SERIALIZATION_OPTIONS, { "default": "fancy_safetensors" }) }
 
 
 def response_input(name = "response"):
@@ -85,11 +105,21 @@ def ws_settings_inputs():
     }
 
 
-def shared_input_settings():
+def shared_input_output_settings():
     return {
         "max_size_mb":      ("INT", { "default": 32, "min": 0, "max": 8 * 1024, "step": 1 }),
         "gzip_compression": ("BOOLEAN", { "default": False }),
         "gzip_level":       ("INT", { "default": 9, "min": 1, "max": 9, "step": 1 }),
+    }
+
+
+def lazy_input_settings():
+    return {
+        "lazily_transfer":             ("BOOLEAN", { "default": False }),
+        "skip_lazy_transfer_under_mb": ("FLOAT", {
+            "default": 0.25, "min": 0.0, "max": 10 * 1024.0, "step": 0.1,
+            "tooltip": "Even when lazily transferring inputs is enabled still always transfer inputs smaller than this size in MB directly.",
+        }),
     }
 
 
@@ -113,7 +143,7 @@ class RemoteRunSerializerOutNode():
             },
             "optional": {
                 **dict((f"input_{num}", (CoIO.ANY, { })) for num in range(_NUM_OUTPUTS)),
-                **shared_input_settings(),
+                **shared_input_output_settings(),
                 **response_input(),
                 "is_changed": ("BOOLEAN", { "default": False }),
             },
@@ -180,6 +210,57 @@ class RemoteRunSerializerOutNode():
         }
 
 
+def setup_remote_run_api_route(expected_set_up: bool):
+    import server
+    from aiohttp import web
+
+    ins = server.PromptServer.instance
+    url = "/remote_run/data/"
+    cur_routes = [ins.routes[i] for i in range(len(ins.routes))]
+    routes = [i for i in cur_routes if i.path == url and (i.method or "").upper() == "POST"]
+    if routes:
+        if len(routes) > 1:
+            raise ValueError("Multiple routes for remote run data endpoint???", routes)
+        route_def = routes[0]
+        handler = route_def.handler
+        data_requests = handler._data_requests
+    else:
+        if expected_set_up:
+            raise ValueError("No existing route for remote run data endpoint, disabled or server startup changed")
+
+        data_requests = weakref.WeakValueDictionary()
+
+        @ins.routes.post(url)
+        async def receive_data(request):
+            key = request.query.get("key")
+            status = request.query.get("status")
+            logger.info("%s", f"RemoteRunDeserializerOutNode.receive_data /remote_run/data/ POST handler key={key!r} status={status!r}")
+            if not key:
+                return web.Response(status = 400, text = "Missing key")
+            notif = data_requests.get(key)
+            if notif is None:
+                return web.Response(status = 400, text = "No data requested for this key")
+
+            if status != "data":
+                notif.update("remote_error", f"remote side error status: {status!r}")
+                return web.Response(status = 200, text = f"Error status: {status!r}")
+
+            notif.update("started", None)
+            try:
+                data = await request.read()
+                notif.update("data", data)
+            except Exception as ex:
+                notif.update("error", ex)
+            return web.Response(status = 200, text = "OK")
+
+        # ins.app.add_routes(api_routes)
+        receive_data._data_requests = data_requests
+
+    if len(data_requests) > 5:
+        logger.warning("%s", f"RemoteRunDeserializerOutNode.setup_server has {len(data_requests)} data requests pending, shouldn't happen")
+    return ins, data_requests
+
+
 class RemoteRunDeserializerOutNode():
     TYPE_NAME = "RAT_RemoteRunDeserializerOut"
     DISPLAY_NAME = "ReRu Deserializer Output (Internal)"
@@ -198,13 +279,17 @@ class RemoteRunDeserializerOutNode():
             },
             "optional": {
                 **inputs,
-                "is_changed": ("BOOLEAN", { "default": False }),
+                "total_timeout":   ("FLOAT", { }),
+                "request_timeout": ("FLOAT", { }),
+                "is_changed":      ("BOOLEAN", { "default": False }),
             },
         }
 
     RETURN_TYPES = tuple([CoIO.ANY] * _NUM_OUTPUTS)
 
-    def run(self, **kwargs):
+    def run(self, total_timeout: float = None, request_timeout: float = None, **kwargs):
+        get_timeout = _make_adjusted_timeout(total_timeout, allow_empty = True)
+
         info_keys = [i for i in kwargs.keys() if i.startswith("input_") and i.endswith("_info")]
         nums = sorted(int(i[6:-5]) for i in info_keys)
         outputs = { }
@@ -218,14 +303,53 @@ class RemoteRunDeserializerOutNode():
             info = json.loads(info_str)
             data_type = info["type"]
             if data_type == "serialized":
-                outputs[in_num] = deserialize_response(info["serialization"], data)
+                outputs[in_num] = deserialize_response(info["serialization"], data, info.get("compression"))
                 continue
 
             if data_type == "request":
-                # setup server route endpoint
-                # send ws dict(type="need_data", key=info["key"])
-                # wait for data to be posted to the endpoint
-                # deserialize & return
+                key = info["key"]
+                serialization = info["serialization"]
+                if serialization not in SERIALIZATION_OPTIONS:
+                    raise ValueError("Invalid serialization option", serialization, SERIALIZATION_OPTIONS, info)
+
+                server_ins, weak_data_requests = setup_remote_run_api_route(expected_set_up = True)
+                client_id = server_ins.client_id
+                if not client_id:
+                    raise ValueError("No client connected to request data from")
+
+                class Notif():
+                    def __init__(self):
+                        self.resq = queue.Queue()
+
+                    def update(self, status, data):
+                        self.resq.put((status, data))
+
+                    def cleanup(self):
+                        _res = weak_data_requests.pop(key, None)
+                        # print("data_pop", key, _res)
+
+                notif = Notif()
+                try:
+                    weak_data_requests[key] = notif
+                    logger.info("%s", f"RemoteRunDeserializerOutNode.run sending NEED_DATA data key={key!r}")
+                    server_ins.send_sync("NEED_DATA", dict(key = key), client_id)
+                    status, _data = notif.resq.get(timeout = get_timeout(request_timeout))
+
+                    if status == "remote_error":
+                        raise ValueError("remote side error requesting data", _data, key, info)
+                    if status != "started":
+                        raise ValueError("unexpected status waiting for data", status, key, info, _data)
+
+                    result, data = notif.resq.get(timeout = get_timeout(request_timeout))
+                    logger.info("%s", f"RemoteRunDeserializerOutNode.run received data key={key!r} {data and len(data)} bytes")
+                finally:
+                    notif.cleanup()
+
+                if result != "data":
+                    raise ValueError("error receiving data", result, key, info, data)
+
+                deserialized = deserialize_response(serialization, data, info.get("compression"))
+                outputs[in_num] = deserialized
                 continue
 
             raise ValueError("Invalid input data type", in_num, info)
@@ -308,12 +432,12 @@ def _shared_input_types():
             "tooltip": "ComfyUI instance URL",
         }),
         "total_timeout":   ("FLOAT", {
-            "tooltip": "timeout in seconds",
-            "default": 90.0, "min": 0.1, "max": 24 * 3600.0, "step": 0.1
+            "tooltip": "Timeout for everything total (sending prompt and running) in seconds. 0 to disable.",
+            "default": 90.0, "min": 0, "max": 24 * 3600.0, "step": 0.1
         }),
         "request_timeout": ("FLOAT", {
-            "tooltip": "short timeout in seconds",
-            "default": 10.0, "min": 0.1, "max": 24 * 3600.0, "step": 0.1
+            "tooltip": "Prompt & data post timeout in seconds",
+            "default": 45.0, "min": 0.1, "max": 24 * 3600.0, "step": 0.1
         }),
         **serialization_load_input(),
         # **output_nodes_input(),
@@ -350,7 +474,8 @@ class RemoteRunInputNode():
             },
             "optional": {
                 **dict((f"input_{num}", (CoIO.ANY, { "lazy": True })) for num in range(_NUM_OUTPUTS)),
-                **shared_input_settings(),
+                **shared_input_output_settings(),
+                **lazy_input_settings(),
                 **response_input(),
                 **ws_settings_inputs(),
                 "run_outputs_connected_to_inputs": (["ignore", "run"], { "default": "ignore" }),
@@ -375,6 +500,7 @@ class RemoteRunInputNode():
             max_size_mb: int | None = None, gzip_compression: bool = False, gzip_level: int = 9, response = None,
             run_outputs_connected_to_inputs = "disconnected", is_changed: bool = False,
             ws_compression: bool = False, forward_progress_messages: str = "off",
+            lazily_transfer: bool = False, skip_lazy_transfer_under_mb: float = 0.25,
             dynprompt: DynamicPrompt = None, own_id = None, _ignore_ = None,
             **_kwargs,
             ):
@@ -384,6 +510,7 @@ class RemoteRunInputNode():
             total_timeout, request_timeout,
             max_size_mb, gzip_compression, gzip_level,
             ws_compression, forward_progress_messages, is_changed, response,
+            lazily_transfer, skip_lazy_transfer_under_mb,
             run_outputs_connected_to_inputs,
         )
 
@@ -415,10 +542,11 @@ class RemoteRunJsonNode():
             },
             "optional": {
                 **dict((f"input_{num}", (CoIO.ANY, { })) for num in range(_NUM_OUTPUTS)),
-                "max_size_mb": shared_input_settings()["max_size_mb"],
+                **shared_input_output_settings(),
+                **lazy_input_settings(),
                 **response_input(),
                 **ws_settings_inputs(),
-                "is_changed":  ("BOOLEAN", { "default": False }),
+                "is_changed": ("BOOLEAN", { "default": False }),
             },
         }
         return inputs
@@ -427,8 +555,9 @@ class RemoteRunJsonNode():
 
     def run(self,
             remote_url: str, total_timeout: float, request_timeout: float, JSON: str, serialization: str,
-            max_size_mb: int | None = None, response = None,
+            max_size_mb: int | None = None, gzip_compression: bool = False, gzip_level: int = 9, response = None,
             ws_compression: bool = False, forward_progress_messages: str = "off",
+            lazily_transfer: bool = False, skip_lazy_transfer_under_mb: float = 0.25,
             **kwargs,
             ):
         max_size_mb = max_size_mb or None
@@ -437,8 +566,8 @@ class RemoteRunJsonNode():
         run_prompt = run_obj["prompt"]
         data_total = 0
 
-        # lazily_transfer = False
-        # no_lazy_if_smaller_than = 32 * 1024
+        lazy_data = { }
+        skip_lazy_transfer_under_mb = skip_lazy_transfer_under_mb * 1024 ** 2 if skip_lazy_transfer_under_mb else None
 
         for node_id, node in run_prompt.items():
             # serialize needed inputs to this node and set up
@@ -446,6 +575,14 @@ class RemoteRunJsonNode():
             if node["class_type"] == RemoteRunDeserializerOutNode.TYPE_NAME:
                 config = node.pop("deserializer_config")
                 outputs = config["outputs"]
+                other_inputs = config["other_inputs"]
+                node_lazily_transfer = other_inputs.get("lazily_transfer", None)
+                if node_lazily_transfer is not None and node_lazily_transfer != "from_input_node":
+                    node_lazily_transfer = { "on": True, "off": False }[node_lazily_transfer.lower()]
+                    node_skip_under = other_inputs["skip_lazy_transfer_under_mb"]
+                else:
+                    node_lazily_transfer = lazily_transfer
+                    node_skip_under = skip_lazy_transfer_under_mb
 
                 inputs = { }
                 for output_name, output_data in outputs.items():
@@ -463,18 +600,60 @@ class RemoteRunJsonNode():
 
                         local_input_name = output_data_value
                         input = kwargs[local_input_name]
+
+                        # TODO: skip serialization if input is basic python types
                         input_data = serialize_obj(serialization, input)
-                        input_data_b64 = base64.b64encode(input_data).decode()
+                        compression = None
+                        if gzip_compression:
+                            start = time.monotonic_ns()
+                            comp = gzip.compress(input_data, compresslevel = gzip_level)
+                            end = time.monotonic_ns()
+                            took_ns = (end - start)
+                            mb_s = (len(input_data) * 1e9) / (took_ns * 1024 * 1024)
+                            took_sec = took_ns / 1e9
+                            factor = len(comp) / len(input_data)
+                            if factor < 0.99:
+                                logger.info("%s", f"RemoteRunJsonNode.run serialization={serialization!r} {response=!r} "
+                                                  f"gzip compressed {len(input_data)} to {len(comp)} bytes, factor {factor:.3f}, "
+                                                  f"took {took_sec:.3f} sec, {mb_s:.2f} MB/s")
+                                input_data = comp
+                                compression = "gzip"
+                            else:
+                                logger.info("%s", f"RemoteRunJsonNode.run serialization={serialization!r} {response=!r} "
+                                                  f"gzip compression not effective, kept original {len(input_data)} bytes "
+                                                  f"over compressed {len(comp)} bytes, factor {factor:.3f}, "
+                                                  f"took {took_sec:.3f} sec, {mb_s:.2f} MB/s")
 
-                        data_total += len(input_data_b64)
-                        if max_size_mb and data_total > max_size_mb * 1024 * 1024:
-                            raise ValueError(f"Serialized data too large: {data_total} bytes, max_size_mb={max_size_mb}")
+                        if node_lazily_transfer and node_skip_under and len(input_data) < node_skip_under:
+                            node_lazily_transfer = False
 
-                        inputs[f"input_{output_num}_info"] = json.dumps({
-                            "type":          "serialized",
-                            "serialization": serialization,
-                        })
-                        inputs[f"input_{output_num}_data"] = input_data_b64
+                        if node_lazily_transfer:
+                            data_total += len(input_data)
+                            if max_size_mb and data_total > max_size_mb * 1024 * 1024:
+                                raise ValueError(f"Serialized data too large: {data_total} bytes, max_size_mb={max_size_mb}")
+
+                            key = hashlib.sha256(hashlib.sha256(input_data).digest()).hexdigest()
+                            lazy_data[key] = input_data
+
+                            inputs[f"input_{output_num}_info"] = json.dumps({
+                                "type":          "request",
+                                "key":           key,
+                                "serialization": serialization,
+                                "compression":   compression,
+                            })
+                            inputs[f"input_{output_num}_data"] = True
+                        else:
+                            input_data_b64 = base64.b64encode(input_data).decode()
+                            data_total += len(input_data_b64)
+                            if max_size_mb and data_total > max_size_mb * 1024 * 1024:
+                                raise ValueError(f"Serialized data too large: {data_total} bytes, max_size_mb={max_size_mb}")
+
+                            inputs[f"input_{output_num}_info"] = json.dumps({
+                                "type":          "serialized",
+                                "serialization": serialization,
+                                "compression":   compression,
+                            })
+                            inputs[f"input_{output_num}_data"] = input_data_b64
                     elif output_data_type == "CONSTANT":
                         inputs[f"input_{output_num}_info"] = "INPUT"
                         inputs[f"input_{output_num}_data"] = output_data_value
@@ -500,6 +679,7 @@ class RemoteRunJsonNode():
             binary_response = binary_response,
             ws_max_size = ws_max, post_max_size = post_max,
             total_timeout = total_timeout, short_timeout = request_timeout,
+            lazy_data = lazy_data,
         )
         obj = deserialize_response(serialization, raw_result)
 
@@ -538,6 +718,9 @@ class RemoteRunStartNode():
                 "remote_run_dependent_outputs": (["ignore", "run"], { "default": "ignore" }),
                 "inputs_when_local":            (INPUTS_OFF_OPTIONS, { "default": "disconnected" }),
                 "outputs_when_local":           (BLOCK_OPTIONS, { "default": "error" }),
+
+                "lazily_transfer":              (["from_input_node", "on", "off"], { "default": "from_input_node" }),
+                **{ k: v for k, v in lazy_input_settings().items() if k == "skip_lazy_transfer_under_mb" },
             },
         }
         return inputs
@@ -667,6 +850,7 @@ def partial_json_expansion(
         total_timeout: float, request_timeout: float,
         max_size_mb: int | None, gzip_compression: bool, gzip_level: int,
         ws_compression: bool, forward_progress_messages: str, is_changed: bool, response: str | None,
+        lazily_transfer: bool, skip_lazy_transfer_under_mb: float,
         run_outputs_connected_to_inputs: str,
 ):
     """
@@ -699,7 +883,7 @@ def partial_json_expansion(
     """
     remote_prompt = copy.deepcopy(prompt)
     next_node_id = make_counter(_max_id(remote_prompt) + 1, str)
-    rcon, dscon = update_toggles_inplace(remote_prompt, True, True, "remote_run_input_toggle", False)
+    rcon, dscon = update_toggles_inplace(remote_prompt, True, True, "remote_run_input_toggle", False, True)
 
     add_outputs_of_inputs = (run_outputs_connected_to_inputs or "").lower() == "run"
 
@@ -735,8 +919,10 @@ def partial_json_expansion(
                 remote_run_dependent_outputs_of_nodes.append(start_id)
 
             des = { }
+            other_inputs = { }
             for input_name, input_value in start_inputs.items():
                 if not input_name.startswith("input_"):
+                    other_inputs[input_name] = input_value
                     continue
 
                 output_name = "output_" + input_name[6:]
@@ -752,7 +938,8 @@ def partial_json_expansion(
             small_prompt[start_id] = {
                 "class_type":          RemoteRunDeserializerOutNode.TYPE_NAME,
                 "deserializer_config": {
-                    "outputs": des,
+                    "outputs":      des,
+                    "other_inputs": other_inputs,
                 },
             }
 
@@ -789,6 +976,8 @@ def partial_json_expansion(
         },
     }
 
+    DEBUG_PROMPT_SAVE("exported_remote_prompt", remote_prompt) if IS_DEV and IS_DEV_PROMPTSAVE else None
+
     remote_obj = dict(
         prompt = remote_prompt,
         extra_output_ids = extra_output_ids,
@@ -810,6 +999,8 @@ def partial_json_expansion(
                 forward_progress_messages = forward_progress_messages,
                 is_changed = is_changed,
                 response = response,
+                lazily_transfer = lazily_transfer,
+                skip_lazy_transfer_under_mb = skip_lazy_transfer_under_mb,
                 **local_expanded_inputs,
             ),
         }
@@ -835,14 +1026,22 @@ def serialize_obj(serialization: str, obj):
     return buf
 
 
-def deserialize_response(serialization: str, result: dict | str | bytes):
+def deserialize_response(serialization: str, result: dict | str | bytes, compression: str | None = None):
     if isinstance(result, dict):
         result_str = result["results"][0]
         data = base64.b64decode(result_str)
     elif isinstance(result, str):
         data = base64.b64decode(result)
-    else:
+    elif isinstance(result, bytes):
         data = result
+    else:
+        raise ValueError("Invalid result type", type(result), result)
+
+    if compression == "gzip":
+        data = gzip.decompress(data)
+    elif compression is not None:
+        raise ValueError("Unknown compression", compression)
+
     return deserialize_data(serialization, data)
 
 
@@ -857,7 +1056,7 @@ def deserialize_data(serialization: str, data: bytes):
         raise ValueError("Unknown serialization method", serialization)
 
 
-def update_toggles_inplace(prompt: dict, toggle: bool, reconnect: bool, label: str, raise_on_existing: bool, input_node_is_local: bool = True):
+def update_toggles_inplace(prompt: dict, toggle: bool, reconnect: bool, label: str, raise_on_existing: bool, input_node_is_local: bool | None = None):
     to_switch = {
         RemoteRunTogglerNode.TYPE_NAME: "inputs_when_off",
         RemoteRunInputNode.TYPE_NAME:   "inputs_when_local",
@@ -886,7 +1085,7 @@ def update_toggles_inplace(prompt: dict, toggle: bool, reconnect: bool, label: s
 
         if (
                 reconnect
-                and enabled
+                and enabled is True
                 and inputs.get(input_name) == "disconnected"
                 and (disconnected_inputs := inputs.get("_ignore_"))
         ):
@@ -907,7 +1106,7 @@ def update_toggles_inplace(prompt: dict, toggle: bool, reconnect: bool, label: s
                              label, len(disconnected_inputs), node_id, disconnected_inputs)
                 reconnected_cnt += 1
 
-        elif not enabled and inputs.get(input_name) == "disconnected":
+        elif enabled is False and inputs.get(input_name) == "disconnected":
             given_inputs = { k: v for k, v in inputs.items() if k.startswith("input_") }
             for k in given_inputs.keys():
                 inputs.pop(k)
@@ -956,18 +1155,46 @@ def retry_dec(total_tries: int = 1, log_exc = True, sleep = None, stop_on = None
     return make_dec
 
 
+def _make_adjusted_timeout(total_timeout: float | None, allow_empty: bool = True):
+    if not total_timeout:
+        if not allow_empty:
+            raise ValueError("total_timeout must be > 0")
+
+        def get(wanted_timeout: float, raise_on_timeout = False):
+            if raise_on_timeout and wanted_timeout <= 0:
+                raise TimeoutError("wanted timeout reached", wanted_timeout)
+            return wanted_timeout
+
+        return get
+
+    if total_timeout < 0:
+        raise ValueError("total_timeout must be >= 0", total_timeout)
+
+    # ensure current timeout wouldn't exceed total_timeout
+    start_ts = time.monotonic()
+
+    def get(wanted_timeout: float, raise_on_timeout = False):
+        left_secs = total_timeout - (time.monotonic() - start_ts)
+        if raise_on_timeout and left_secs <= 0:
+            raise TimeoutError("total timeout reached", total_timeout)
+        return min(left_secs, wanted_timeout)
+
+    return get
+
+
 def remote_execute_prompt(
         base_url: str, prompt: dict,
         own_id: str, extra_output_ids: list[str] | None,
         ws_compression: bool, forward_progress_messages: str,
         binary_response: bool, ws_max_size: int | None, post_max_size: int | None,
         total_timeout: float, short_timeout: float,
+        lazy_data: dict | None = None,
         total_tries = 3,
 ):
     ws_max_size = ws_max_size or 64 * 1024 * 1024
 
-    total_timeout = total_timeout or 10  # expected to always be set, so default to low ones in case of unset
-    short_timeout = short_timeout or 5
+    total_timeout = total_timeout  # can be 0 to disable
+    short_timeout = short_timeout or 5  # expected to always be set, so default to low ones in case of unset
 
     base_url = base_url.rstrip("/")
     base_ws_url = base_url.replace("http://", "ws://")
@@ -975,19 +1202,7 @@ def remote_execute_prompt(
     client_id = str(uuid4())
     post_nonce = str(uuid4())
 
-    def _make_adjusted_timeout(total_timeout: float):
-        # ensure current timeout wouldn't exceed total_timeout
-        start_ts = time.monotonic()
-
-        def get(wanted_timeout: float, raise_on_timeout = False):
-            left_secs = total_timeout - (time.monotonic() - start_ts)
-            if raise_on_timeout and left_secs <= 0:
-                raise TimeoutError("total timeout reached", total_timeout)
-            return min(left_secs, wanted_timeout)
-
-        return get
-
-    adjusted_timeout_fn = _make_adjusted_timeout(total_timeout)
+    adjusted_timeout_fn = _make_adjusted_timeout(total_timeout or None, allow_empty = True)
 
     @retry_dec(total_tries, stop_on = TimeoutError)
     def post(timeout):
@@ -999,13 +1214,15 @@ def remote_execute_prompt(
             partial_execution_targets = list(extra_output_ids or []) + [own_id],
         )
 
+        DEBUG_PROMPT_SAVE("post_prompt", prompt) if IS_DEV and IS_DEV_PROMPTSAVE else None
+
         body = json.dumps(apicall)
         if isinstance(body, str):
             body = body.encode()
         if post_max_size and len(body) > post_max_size:
             raise ValueError(f"Post body too large: {len(body)} bytes, post_max_size={post_max_size}")
 
-        logger.debug("Posting prompt to url=%r, size=%d, timeout=%.1f", post_url, len(body), timeout)
+        logger.info("Posting prompt to url=%r, size=%d, timeout=%.1f", post_url, len(body), timeout)
 
         headers = { "Content-Type": "application/json" }
         resp = requests.post(post_url, data = body, headers = headers, timeout = adjusted_timeout_fn(timeout, True))
@@ -1014,6 +1231,21 @@ def remote_execute_prompt(
 
         obj = resp.json()
         return obj["prompt_id"]
+
+    @retry_dec(total_tries, stop_on = (TimeoutError, ValueError))
+    def post_lazy_data(key, status, body: bytes | None, timeout):
+        params = dict(
+            key = key,
+            status = status,
+        )
+        post_url = base_url + "/api/remote_run/data/"
+        headers = { }
+        logger.info("Posting requested lazy data to url=%r, params=%r, size=%d, timeout=%.1f",
+                    post_url, params, len(body or ""), timeout)
+        resp = requests.post(post_url, params = params, data = body, headers = headers, timeout = adjusted_timeout_fn(timeout, True))
+        if resp.status_code != 200:
+            raise ValueError("Failed to post prompt", post_url, resp.status_code, resp.content)
+        return resp.content
 
     ws_url = base_ws_url + f"/ws?clientId={client_id}"
 
@@ -1062,12 +1294,34 @@ def remote_execute_prompt(
 
             message_len = len(message or "")
             message_obj = json.loads(message)
+            # print("ws message", message_obj) if IS_DEV else None
+
+            msg_type = message_obj.get("type")
+            if msg_type == "NEED_DATA":
+                logger.info("Got NEED_DATA message for: %s", message_obj)
+                key = None
+                try:
+                    req_obj = message_obj["data"]
+                    key = req_obj["key"]
+                    if lazy_data and key in lazy_data:
+                        data = lazy_data.pop(key)
+                        post_lazy_data(key, "data", data, short_timeout)
+                        continue
+                    else:
+                        logger.error("No lazy data found for key %r, sending empty response", key)
+                        post_lazy_data(key, "not_found", None, short_timeout)
+                except Exception:
+                    logger.exception("Invalid NEED_DATA message data")
+                    if key:
+                        post_lazy_data(key, "error", None, short_timeout)
+
+                raise ValueError("Invalid NEED_DATA message", message_obj)
 
             own_prompt_id = message_obj.get("data", { }).get("prompt_id") == prompt_id
             if own_prompt_id:
                 if (
                         forward_ws_messages
-                        and (msg_type := message_obj.get("type")) in forwarded_types
+                        and msg_type in forwarded_types
                         and (data := message_obj.get("data"))
                 ):
                     node = data.get("node")
@@ -1080,17 +1334,17 @@ def remote_execute_prompt(
                             logger.debug("Forwarding remote prompt server message type=%r, node=%r, client_id=%r, size=%d",
                                          msg_type, node, client_id, message_len)
                             instance.send_sync(msg_type, data, client_id)
-                        except Exception as e:
+                        except Exception:
                             logger.exception("Failed to forward remote prompt server message type=%r, node=%r, client_id=%r",
                                              msg_type, node, client_id)
 
-                if message_obj.get("type") == "executed":
+                if msg_type == "executed":
                     logger.debug("got executed message for own prompt_id=%r, size=%d", prompt_id, message_len)
                     data = message_obj["data"]
                     if data["node"] == own_id:
                         result = data["output"]
                         return result
-                elif own_prompt_id and message_obj.get("type") == "execution_error":
+                elif own_prompt_id and msg_type == "execution_error":
                     raise ValueError("remote comfy prompt execution error", message_obj, base_url, prompt)
     except TimeoutError:
         # TODO: interrupt execution of that prompt in case of timeout?? always or option
@@ -1180,7 +1434,7 @@ class RemoteRunAddRemoteNodeDefinitionsNode():
                     "tooltip": "ComfyUI instance URL",
                 }),
                 "request_timeout":      ("FLOAT", {
-                    "tooltip": "short timeout in seconds",
+                    "tooltip": "Request timeout in seconds",
                     "default": 15.0, "min": 0.1, "max": 24 * 3600.0, "step": 0.1
                 }),
                 "dry_run":              ("BOOLEAN", { "default": False }),
@@ -1351,9 +1605,14 @@ def add_server_prompt_input_disconnect_handler():
 
         original_request = copy.deepcopy(original_request)
         prompt = original_request["prompt"]
-        rcon, dscon = update_toggles_inplace(prompt, False, False, "input_disconnect_handler", raise_on_existing = True)
+        DEBUG_PROMPT_SAVE("rr_prompt_handler__pre_rewrite_prompt__", prompt) if IS_DEV and IS_DEV_PROMPTSAVE else None
+
+        rcon, dscon = update_toggles_inplace(prompt, False, False, "input_disconnect_handler",
+                                             raise_on_existing = True, input_node_is_local = False)  # False so it gets disconnected
         if rcon or dscon:
             logger.info("remote_run input disconnect handler, reconnected %d, disconnected %d nodes", rcon, dscon)
+
+        DEBUG_PROMPT_SAVE("rr_prompt_handler__rerewritten_prompt", prompt) if IS_DEV and IS_DEV_PROMPTSAVE else None
         return original_request
 
     if os.environ.get("HOTRELOAD"):
@@ -1384,6 +1643,15 @@ if os.environ.get("SKIP_REMOTE_RUN_INPUT_DISCONNECT_HANDLER") != "1":
         logger.exception("Failed to add remote_run input disconnect handler")
 else:
     logger.info("skipping remote_run input disconnect handler due to env var.")
+
+if os.environ.get("SKIP_REMOTE_RUN_ADD_DATA_ROUTE") != "1":
+    logger.info("SKIP_REMOTE_RUN_ADD_DATA_ROUTE=1 not given, adding remote_run data route handler!")
+    try:
+        setup_remote_run_api_route(expected_set_up = False)
+    except Exception as e:
+        logger.exception("Failed to add remote_run data route handler")
+else:
+    logger.info("skipping remote_run data route handler due to env var.")
 
 
 def node_mappings(classes):
