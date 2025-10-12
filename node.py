@@ -125,7 +125,7 @@ def lazy_input_settings():
 
 class RemoteRunSerializerOutNode():
     TYPE_NAME = "RAT_RemoteRunSerializerOut"
-    DISPLAY_NAME = "ReRu Serializer Output (Internal)"
+    DISPLAY_NAME = "RemRun Serializer Output (Internal)"
 
     CATEGORY = "Remote Run/__Internal__/"
     FUNCTION = "run"
@@ -263,7 +263,7 @@ def setup_remote_run_api_route(expected_set_up: bool):
 
 class RemoteRunDeserializerOutNode():
     TYPE_NAME = "RAT_RemoteRunDeserializerOut"
-    DISPLAY_NAME = "ReRu Deserializer Output (Internal)"
+    DISPLAY_NAME = "RemRun Deserializer Output (Internal)"
 
     CATEGORY = "Remote Run/__Internal__/"
     FUNCTION = "run"
@@ -359,7 +359,7 @@ class RemoteRunDeserializerOutNode():
 
 class RemoteRunTogglerNode():
     TYPE_NAME = "RAT_RemoteRunToggler"
-    DISPLAY_NAME = "ReRu Toggle"
+    DISPLAY_NAME = "RemRun Toggle"
 
     """
     This is a Input Toggle Switch that can be used to enable/disable certain parts of a graph
@@ -456,7 +456,7 @@ def _get_max_size(max_size_mb: int | None):
 
 class RemoteRunInputNode():
     TYPE_NAME = "RAT_RemoteRunInput"
-    DISPLAY_NAME = "ReRu Input Graph(s)"
+    DISPLAY_NAME = "RemRun Input Graph(s)"
 
     NUM_OUTPUTS = _NUM_OUTPUTS
     CATEGORY = "Remote Run"
@@ -517,13 +517,13 @@ class RemoteRunInputNode():
 
 class RemoteRunInputOutputNode(RemoteRunInputNode):
     TYPE_NAME = "RAT_RemoteRunInputOutput"
-    DISPLAY_NAME = "ReRu Input Graph(s) Output"
+    DISPLAY_NAME = "RemRun Input Graph(s) Output"
     OUTPUT_NODE = True
 
 
 class RemoteRunJsonNode():
     TYPE_NAME = "RAT_RemoteRunJson"
-    DISPLAY_NAME = "ReRu JSON"
+    DISPLAY_NAME = "RemRun JSON"
 
     NUM_OUTPUTS = _NUM_OUTPUTS
     CATEGORY = "Remote Run"
@@ -705,7 +705,7 @@ def block_option_return(option: str, kwargs, num_outputs, error_msg, block_msg):
 
 class RemoteRunStartNode():
     TYPE_NAME = "RAT_RemoteRunStart"
-    DISPLAY_NAME = "ReRu Start From Here ->"
+    DISPLAY_NAME = "RemRun Start From Here ->"
 
     CATEGORY = "Remote Run"
     FUNCTION = "run"
@@ -1357,7 +1357,7 @@ def remote_execute_prompt(
 
 
 class RemoteRunSetNumOutputsNode():
-    DISPLAY_NAME = "ReRu Set Num Outputs"
+    DISPLAY_NAME = "RemRun Set Num Outputs"
 
     CATEGORY = "Remote Run"
     FUNCTION = "run"
@@ -1419,7 +1419,7 @@ def filter_definitions(definitions: dict, kwargs):
 
 
 class RemoteRunAddRemoteNodeDefinitionsNode():
-    DISPLAY_NAME = "ReRu Add Remote Node Definitions"
+    DISPLAY_NAME = "RemRun Add Remote Node Definitions"
 
     CATEGORY = "Remote Run"
     FUNCTION = "run"
