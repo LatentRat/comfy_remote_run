@@ -15,9 +15,10 @@
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # TODO: option to actually run IS_CHANGED checks remotely
-# TODO: option to lazily serialize/send inputs only when needed remotely? and option to cache them remotely too
 # TODO: torch weights_only option
 # TODO: clear remote history item afterwards option
+# TODO: IS_CHANGED return _ignore_ when disconnected option or always?
+# TODO: forward interruptions option
 
 import base64
 import collections
