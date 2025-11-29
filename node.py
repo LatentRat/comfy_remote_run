@@ -13,15 +13,16 @@
 #
 #    You should have received a copy of the GNU General Public License
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
 # TODO: option to actually run IS_CHANGED checks remotely
 # TODO: torch weights_only option
 # TODO: clear remote history item afterwards option
 # TODO: IS_CHANGED return _ignore_ when disconnected option or always?
 # TODO: forward interruptions option
 
+import asyncio
 import base64
 import collections
+import concurrent.futures
 import copy
 import enum
 import functools
@@ -482,6 +483,7 @@ class RemoteRunInputNode():
                 "run_outputs_connected_to_inputs": (["ignore", "run"], { "default": "ignore" }),
                 "inputs_when_local":               (INPUTS_OFF_OPTIONS, { "default": "disconnected" }),
                 "is_changed":                      ("BOOLEAN", { "default": False }),
+                "run_sync":                        ("BOOLEAN", { "default": False }),
                 "_ignore_":                        ("INTERNAL", { "default": "" }),
             },
             "hidden":   {
@@ -502,6 +504,7 @@ class RemoteRunInputNode():
             run_outputs_connected_to_inputs = "disconnected", is_changed: bool = False,
             ws_compression: bool = False, forward_progress_messages: str = "off",
             lazily_transfer: bool = False, skip_lazy_transfer_under_mb: float = 0.25,
+            run_sync: bool = False,
             dynprompt: DynamicPrompt = None, own_id = None, _ignore_ = None,
             **_kwargs,
             ):
@@ -511,7 +514,7 @@ class RemoteRunInputNode():
             total_timeout, request_timeout,
             max_size_mb, gzip_compression, gzip_level,
             ws_compression, forward_progress_messages, is_changed, response,
-            lazily_transfer, skip_lazy_transfer_under_mb,
+            lazily_transfer, skip_lazy_transfer_under_mb, run_sync,
             run_outputs_connected_to_inputs,
         )
 
@@ -554,13 +557,13 @@ class RemoteRunJsonNode():
 
     RETURN_TYPES = tuple([CoIO.ANY] * _NUM_OUTPUTS)
 
-    def run(self,
-            remote_url: str, total_timeout: float, request_timeout: float, JSON: str, serialization: str,
-            max_size_mb: int | None = None, gzip_compression: bool = False, gzip_level: int = 9, response = None,
-            ws_compression: bool = False, forward_progress_messages: str = "off",
-            lazily_transfer: bool = False, skip_lazy_transfer_under_mb: float = 0.25,
-            **kwargs,
-            ):
+    def preprocess(self,
+                   remote_url: str, total_timeout: float, request_timeout: float, JSON: str, serialization: str,
+                   max_size_mb: int | None = None, gzip_compression: bool = False, gzip_level: int = 9, response = None,
+                   ws_compression: bool = False, forward_progress_messages: str = "off",
+                   lazily_transfer: bool = False, skip_lazy_transfer_under_mb: float = 0.25,
+                   **kwargs,
+                   ):
         max_size_mb = max_size_mb or None
         run_obj = json.loads(JSON)
         extra_output_ids = run_obj.get("extra_output_ids") or None
@@ -674,7 +677,8 @@ class RemoteRunJsonNode():
 
         post_max, ws_max = _get_max_size(max_size_mb)
         binary_response = response == "binary"
-        raw_result = remote_execute_prompt(
+
+        fn = lambda: remote_execute_prompt(
             remote_url, run_prompt, serialized_id, extra_output_ids = extra_output_ids,
             ws_compression = ws_compression, forward_progress_messages = forward_progress_messages,
             binary_response = binary_response,
@@ -682,6 +686,30 @@ class RemoteRunJsonNode():
             total_timeout = total_timeout, short_timeout = request_timeout,
             lazy_data = lazy_data,
         )
+        return fn
+
+    async def run(self, *args, **kwargs):
+        fn = self.preprocess(*args, **kwargs)
+
+        thread_exec = concurrent.futures.ThreadPoolExecutor()
+        raw_result = await asyncio.get_event_loop().run_in_executor(thread_exec, fn)
+
+        serialization = kwargs["serialization"]
+        obj = deserialize_response(serialization, raw_result)
+
+        result = tuple(obj.get(f"input_{num}", None) for num in range(_NUM_OUTPUTS))
+        return result
+
+
+class RemoteRunJsonSyncNode(RemoteRunJsonNode):
+    TYPE_NAME = "RAT_RemoteRunJsonSync"
+    DISPLAY_NAME = "RemRun JSON Sync"
+
+    def run(self, *args, **kwargs):
+        fn = self.preprocess(*args, **kwargs)
+        raw_result = fn()
+
+        serialization = kwargs["serialization"]
         obj = deserialize_response(serialization, raw_result)
 
         result = tuple(obj.get(f"input_{num}", None) for num in range(_NUM_OUTPUTS))
@@ -851,7 +879,7 @@ def partial_json_expansion(
         total_timeout: float, request_timeout: float,
         max_size_mb: int | None, gzip_compression: bool, gzip_level: int,
         ws_compression: bool, forward_progress_messages: str, is_changed: bool, response: str | None,
-        lazily_transfer: bool, skip_lazy_transfer_under_mb: float,
+        lazily_transfer: bool, skip_lazy_transfer_under_mb: float, run_sync: bool,
         run_outputs_connected_to_inputs: str,
 ):
     """
@@ -986,7 +1014,7 @@ def partial_json_expansion(
     json_node_id_str = next_node_id()
     new_graph = {
         json_node_id_str: {
-            "class_type": RemoteRunJsonNode.TYPE_NAME,
+            "class_type": RemoteRunJsonSyncNode.TYPE_NAME if run_sync else RemoteRunJsonNode.TYPE_NAME,
             "inputs":     dict(
                 JSON = json.dumps(remote_obj),
                 remote_url = remote_url,
@@ -1671,6 +1699,7 @@ REMOTE_RUN_RUN_NODES = [
     RemoteRunInputNode,
     RemoteRunInputOutputNode,
     RemoteRunJsonNode,
+    RemoteRunJsonSyncNode,
 ]
 NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS = node_mappings(
     (
