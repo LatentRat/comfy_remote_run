@@ -494,6 +494,7 @@ class RemoteRunInputNode():
         return inputs
 
     RETURN_TYPES = tuple([CoIO.ANY] * _NUM_OUTPUTS)
+    RETURN_NAMES = tuple([f"out_{num}" for num in range(_NUM_OUTPUTS)])
 
     def check_lazy_status(self, **_kwargs):
         return []
@@ -767,6 +768,7 @@ class RemoteRunStartNode():
         return True
 
     RETURN_TYPES = tuple([CoIO.ANY] * _NUM_OUTPUTS)
+    RETURN_NAMES = tuple([f"out_{num}" for num in range(_NUM_OUTPUTS)])
 
     def run(self, outputs_when_local: str = None, **kwargs):
         error_msg = f"{self.DISPLAY_NAME!r} node output used locally, but outputs_when_local is set to 'error'"
@@ -1220,6 +1222,7 @@ def remote_execute_prompt(
         lazy_data: dict | None = None,
         total_tries = 3,
 ):
+    # TODI: make async
     ws_max_size = ws_max_size or 64 * 1024 * 1024
 
     total_timeout = total_timeout  # can be 0 to disable
@@ -1298,6 +1301,7 @@ def remote_execute_prompt(
         forwarded_types = { "executing", "progress_state" }
 
         while True:
+            # TODO: option to reconnect websocket?
             message = websocket.recv(timeout = adjusted_timeout_fn(total_timeout, True))
             if isinstance(message, bytes):
                 if not binary_response:
