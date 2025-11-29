@@ -399,9 +399,9 @@ class RemoteRunTogglerNode():
 
     RETURN_TYPES = tuple([CoIO.ANY] * _NUM_OUTPUTS)
 
-    @classmethod
-    def IS_CHANGED(self, **_kwargs):
-        return None
+    # @classmethod
+    # def IS_CHANGED(self, **_kwargs):
+    #     return None
 
     def check_lazy_status(self, enabled: str, own_id = None, **kwargs):
         if enabled not in TOGGLE_CHOICES:
@@ -465,8 +465,22 @@ class RemoteRunInputNode():
     FUNCTION = "run"
 
     @classmethod
-    def IS_CHANGED(cls, is_changed: bool = False, **_kwargs):
-        return time.time_ns() if is_changed else None
+    def IS_CHANGED(cls, is_changed: bool | str = "auto", _ignore_ = None, inputs_when_local = None, **_kwargs):
+        if isinstance(is_changed, bool):
+            return time.time_ns() if is_changed else None
+
+        if is_changed == "run_every_time":
+            return time.time_ns()
+
+        if is_changed == "default_behaviour":
+            return None
+
+        if is_changed == "auto":
+            if inputs_when_local == "disconnected":
+                return _ignore_
+            return None
+
+        return None
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -481,8 +495,15 @@ class RemoteRunInputNode():
                 **response_input(),
                 **ws_settings_inputs(),
                 "run_outputs_connected_to_inputs": (["ignore", "run"], { "default": "ignore" }),
-                "inputs_when_local":               (INPUTS_OFF_OPTIONS, { "default": "disconnected" }),
-                "is_changed":                      ("BOOLEAN", { "default": False }),
+                "inputs_when_local":               (INPUTS_OFF_OPTIONS, { "default": "lazy" }),
+                "is_changed":                      (["run_every_time", "auto", "default_behaviour"], {
+                    "default": "auto",
+                    "tooltip": """
+run_every_time: Always treat as changed and re-run remote prompt every time.
+auto: When inputs_when_local is set to "disconnected" this should fix it not re-rerunning if the inputs changed.
+default_behaviour: Only rerun when inputs changed, this will not work correctly when inputs_when_local is "disconnected" as it can't detect changes then.
+                    """
+                }),
                 "run_sync":                        ("BOOLEAN", { "default": False }),
                 "_ignore_":                        ("INTERNAL", { "default": "" }),
             },
@@ -502,7 +523,7 @@ class RemoteRunInputNode():
     def run(self,
             remote_url: str, total_timeout: float, request_timeout: float, serialization: str,
             max_size_mb: int | None = None, gzip_compression: bool = False, gzip_level: int = 9, response = None,
-            run_outputs_connected_to_inputs = "disconnected", is_changed: bool = False,
+            run_outputs_connected_to_inputs = "ignore", is_changed: bool = False,
             ws_compression: bool = False, forward_progress_messages: str = "off",
             lazily_transfer: bool = False, skip_lazy_transfer_under_mb: float = 0.25,
             run_sync: bool = False,
@@ -798,7 +819,7 @@ def make_counter(start: int, map = None):
     return get
 
 
-def get_input_graph_nodes(prompt: dict, root_node_id: str) -> tuple[set[str], set[str]]:
+def get_remote_run_input_graph_nodes(prompt: dict, root_node_id: str) -> tuple[set[str], set[str]]:
     start_nodes = set()
     input_nodes = set()
 
@@ -821,6 +842,26 @@ def get_input_graph_nodes(prompt: dict, root_node_id: str) -> tuple[set[str], se
     _nodes(root_node_id, set())
 
     return start_nodes, input_nodes
+
+
+def get_input_graph_nodes(prompt: dict, root_node_id: str) -> set[str]:
+    input_nodes = set()
+
+    def _nodes(node_id: str, seen):
+        if node_id in seen:
+            return
+        seen.add(node_id)
+
+        node = prompt[node_id]
+        inputs = node["inputs"]
+        for inp in inputs.values():
+            if isinstance(inp, list):
+                input_nodes.add(inp[0])
+                _nodes(inp[0], seen)
+
+    _nodes(root_node_id, set())
+
+    return input_nodes
 
 
 def get_full_dependents_of_outputs(prompt: dict, of_main_node_ids: set[str], stop_at_node_ids = None) -> dict[str, set[str]]:
@@ -925,7 +966,7 @@ def partial_json_expansion(
     extra_output_ids = None
     local_expanded_inputs = { }
     remote_run_dependent_outputs_of_nodes = []
-    start_node_ids, other_node_ids = get_input_graph_nodes(remote_prompt, root_node_id)
+    start_node_ids, other_node_ids = get_remote_run_input_graph_nodes(remote_prompt, root_node_id)
 
     # The D -> E -> F part(s), anything before the RemoteRunInput node back up to any RemoteRunStart nodes
     # and anything starting on its own.
@@ -1028,7 +1069,8 @@ def partial_json_expansion(
                 gzip_level = gzip_level,
                 ws_compression = ws_compression,
                 forward_progress_messages = forward_progress_messages,
-                is_changed = is_changed,
+                # is_changed = is_changed,
+                is_changed = True,
                 response = response,
                 lazily_transfer = lazily_transfer,
                 skip_lazy_transfer_under_mb = skip_lazy_transfer_under_mb,
@@ -1088,9 +1130,12 @@ def deserialize_data(serialization: str, data: bytes):
 
 
 def update_toggles_inplace(prompt: dict, toggle: bool, reconnect: bool, label: str, raise_on_existing: bool, input_node_is_local: bool | None = None):
+    org_prompt = copy.deepcopy(prompt)
+
     to_switch = {
-        RemoteRunTogglerNode.TYPE_NAME: "inputs_when_off",
-        RemoteRunInputNode.TYPE_NAME:   "inputs_when_local",
+        RemoteRunTogglerNode.TYPE_NAME:     "inputs_when_off",
+        RemoteRunInputNode.TYPE_NAME:       "inputs_when_local",
+        RemoteRunInputOutputNode.TYPE_NAME: "inputs_when_local",
     }
     reconnected_cnt = disconnected_cnt = 0
     for node_id, node in prompt.items():
@@ -1118,14 +1163,15 @@ def update_toggles_inplace(prompt: dict, toggle: bool, reconnect: bool, label: s
                 reconnect
                 and enabled is True
                 and inputs.get(input_name) == "disconnected"
-                and (disconnected_inputs := inputs.get("_ignore_"))
+                and (disconnected_info_str := inputs.get("_ignore_"))
         ):
             # restore original disconnected inputs for remote side
             try:
-                disconnected_inputs = json.loads(disconnected_inputs)
+                disconnected_info = json.loads(disconnected_info_str)
+                disconnected_inputs = disconnected_info["inputs"]
             except Exception as e:
-                logger.error("%s RemoteRunToggler.run invalid disconnected_inputs %r: %s", label, disconnected_inputs, e)
-                raise ValueError("Invalid disconnected_inputs", node_id, disconnected_inputs, e)
+                logger.error("%s RemoteRunToggler.run invalid disconnected_inputs %r: %s", label, disconnected_info_str, e)
+                raise ValueError("Invalid disconnected_inputs", node_id, disconnected_info_str, e)
 
             if disconnected_inputs:
                 for inp_name, inp_val in disconnected_inputs.items():
@@ -1153,7 +1199,14 @@ def update_toggles_inplace(prompt: dict, toggle: bool, reconnect: bool, label: s
                     logger.warning("%s overwriting existing _ignore_ on node_id=%r, cur=%r, new=%r",
                                    label, node_id, cur, given_inputs)
 
-            inputs["_ignore_"] = json.dumps(given_inputs)
+            disconnected_info = { "inputs": given_inputs }
+            if class_type in (RemoteRunInputNode.TYPE_NAME, RemoteRunInputOutputNode.TYPE_NAME):
+                if inputs.get(input_name) == "disconnected":
+                    input_ids = get_input_graph_nodes(org_prompt, node_id)
+                    input_prompt = { i: org_prompt[i] for i in input_ids }
+                    disconnected_info["input_prompt"] = input_prompt
+
+            inputs["_ignore_"] = json.dumps(disconnected_info)
             logger.debug("%s disconnected inputs for node_id=%r, inputs=%s",
                          label, node_id, given_inputs)
             disconnected_cnt += 1
