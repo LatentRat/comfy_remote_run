@@ -1,0 +1,15 @@
+[project]
+name = "comfy_remote_run"
+description = "Nodes to run nodes on remote ComfyUI instances."
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = ["websockets>=12.0.0,<14.0.0"]
+
+[project.urls]
+Repository = "https://github.com/LatentRat/comfy_remote_run"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "comfy_remote_run"
+Icon = ""
